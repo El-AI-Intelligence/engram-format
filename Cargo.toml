@@ -1,0 +1,43 @@
+[package]
+name = "axiom-engram"
+version = "0.1.4"
+edition = "2021"
+description = "The Engram encryption & storage format — encrypted-at-rest vault, FTS5 + vector retrieval, and the end-to-end encrypted sync wire format."
+authors = ["El-AI-Intelligence"]
+license = "Apache-2.0"
+repository = "https://github.com/El-AI-Intelligence/engram-format"
+readme = "README.md"
+keywords = ["memory", "storage-format", "encryption", "sqlcipher", "vector-search"]
+categories = ["database-implementations", "cryptography"]
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+async-trait = "0.1"
+argon2 = "0.5"
+parking_lot = "0.12"
+tracing = "0.1"
+
+# ONNX Runtime for zero-config local embeddings (all-MiniLM-L6-v2, 384-dim)
+# Candle: pure-Rust ML framework for zero-config BERT embeddings
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+# HuggingFace tokenizer for BERT-compatible model tokenization
+tokenizers = { version = "0.21", optional = true }
+# Model download from HuggingFace Hub
+hf-hub = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.40", features = ["full"] }
+
+[features]
+default = []
+onnx-embed = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]

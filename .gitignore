@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Credentials — never commit
+engram-password.txt
+
+# Local vault data (real memories) — never commit
+engram-data/
+
+# Env files
+.env
+.env.local
+*.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+**/.DS_Store
+
+# Node / web
+node_modules/
+dist/
+sdks/python-engramd/dist/
+
+# Python cache
+__pycache__/
+*.pyc
