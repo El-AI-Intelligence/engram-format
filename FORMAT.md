@@ -144,7 +144,7 @@ crashed mid-migration cannot claim a version it does not have.
 - `normalized_hash(content)` =
   `hex( SHA-256( lowercase( join(whitespace( strip_hook_prefixes(content)) ) ) ) )`
   — hook-prefix stripping removes shell counter prefixes like
-  `[89] [10:23:45] [/home/e/engram]`.
+  `[89] [10:23:45] [/home/alice/engram]`.
 - Duplicate captures (equal normalized hash) strengthen the existing row
   instead of inserting.
 - Near-duplicate captures (embedding cosine ≥ 0.95) are skipped and

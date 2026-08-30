@@ -10,7 +10,7 @@
 use crate::EngramSource;
 use sha2::{Digest, Sha256};
 
-/// Strip shell-hook counter prefixes like `[89] [10:23:45] [/home/e/engram]`
+/// Strip shell-hook counter prefixes like `[89] [10:23:45] [/home/alice/engram]`
 /// from the start of a captured command. Returns the original string
 /// unchanged when the leading bracket content isn't a counter, timestamp,
 /// or absolute path (so `[note] decided X` is preserved).
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn strips_counter_prefixes() {
-        let stripped = strip_prefixes("[89] [10:23:45] [/home/e/engram] cargo check");
+        let stripped = strip_prefixes("[89] [10:23:45] [/home/alice/engram] cargo check");
         assert_eq!(stripped, "cargo check");
     }
 

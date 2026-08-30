@@ -3203,7 +3203,7 @@ mod tests {
         let e = Engram::new_episodic(
             "worked on the engram deploy".to_string(),
             EngramSource::Window,
-            serde_json::json!({"cwd": "/home/e/engram"}),
+            serde_json::json!({"cwd": "/home/alice/engram"}),
         );
         let id = e.id.clone();
         store.write(&e).await.unwrap();
@@ -3218,7 +3218,7 @@ mod tests {
         let mut e = Engram::new_episodic(
             "deployed the site".to_string(),
             EngramSource::Window,
-            serde_json::json!({"cwd": "/home/e/other"}),
+            serde_json::json!({"cwd": "/home/alice/other"}),
         );
         e.project = Some("engram".into());
         e.tags = vec!["deploy".into()];
