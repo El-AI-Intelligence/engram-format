@@ -77,6 +77,12 @@ pub enum EngramSource {
     Consolidation,
     Imagined,
     Chat,
+    /// Chat-capture bot messages, one variant per platform (the chat bots
+    /// capture through the daemon's `POST /memories` with a per-platform
+    /// source, so filters can tell Slack from Discord from Telegram).
+    Slack,
+    Discord,
+    Telegram,
     Window,
     Mic,
     Agent,
@@ -97,6 +103,9 @@ impl EngramSource {
             EngramSource::Consolidation => "consolidation",
             EngramSource::Imagined => "imagined",
             EngramSource::Chat => "chat",
+            EngramSource::Slack => "slack",
+            EngramSource::Discord => "discord",
+            EngramSource::Telegram => "telegram",
             EngramSource::Window => "window",
             EngramSource::Mic => "mic",
             EngramSource::Agent => "agent",
@@ -115,6 +124,9 @@ impl EngramSource {
             "consolidation" => Some(EngramSource::Consolidation),
             "imagined" => Some(EngramSource::Imagined),
             "chat" => Some(EngramSource::Chat),
+            "slack" => Some(EngramSource::Slack),
+            "discord" => Some(EngramSource::Discord),
+            "telegram" => Some(EngramSource::Telegram),
             "window" => Some(EngramSource::Window),
             "mic" => Some(EngramSource::Mic),
             "agent" => Some(EngramSource::Agent),

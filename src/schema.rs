@@ -10,7 +10,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS engrams (
             id              TEXT PRIMARY KEY,
             layer           TEXT NOT NULL CHECK(layer IN ('episodic','semantic','imagined')),
-            source          TEXT NOT NULL DEFAULT 'interaction' CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
+            source          TEXT NOT NULL DEFAULT 'interaction' CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','slack','discord','telegram','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
             privacy_level   TEXT NOT NULL DEFAULT 'cloud_first' CHECK(privacy_level IN ('strict_local','hybrid','cloud_first','enterprise')),
             content         TEXT NOT NULL,
             context         TEXT NOT NULL,
@@ -141,7 +141,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Apply schema migrations for columns added after the initial release.
 ///
 /// Current schema version. Increment this when adding new migrations below.
-const CURRENT_SCHEMA_VERSION: i32 = 6;
+const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 /// Versioned schema migrations using SQLite's `PRAGMA user_version`.
 ///
@@ -161,6 +161,7 @@ const CURRENT_SCHEMA_VERSION: i32 = 6;
 ///   v3 → v4: Added content_hash for capture dedupe + app_metrics counters (2026-08-13)
 ///   v4 → v5: Added modified_at so edits re-push to sync (2026-08-13)
 ///   v5 → v6: Added synced_at for the per-memory push cursor (2026-08-14)
+///   v6 → v7: Added slack, discord, telegram to source CHECK constraint (2026-09-05)
 #[allow(clippy::needless_return)]
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.query_row(
@@ -280,7 +281,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                 "CREATE TABLE engrams_v3 (
                     id              TEXT PRIMARY KEY,
                     layer           TEXT NOT NULL CHECK(layer IN ('episodic','semantic','imagined')),
-                    source          TEXT NOT NULL DEFAULT 'interaction' CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
+                    source          TEXT NOT NULL DEFAULT 'interaction' CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','slack','discord','telegram','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
                     privacy_level   TEXT NOT NULL DEFAULT 'cloud_first' CHECK(privacy_level IN ('strict_local','hybrid','cloud_first','enterprise')),
                     content         TEXT NOT NULL,
                     context         TEXT NOT NULL,
@@ -477,6 +478,100 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
         conn.execute_batch("COMMIT")?;
+    }
+
+    if version < 7 {
+        // v7: Add slack, discord, telegram to source CHECK constraint.
+        // Same table-recreate pattern as v3 (SQLite can't ALTER a CHECK),
+        // and the v4/v5/v6 ensure blocks above have already run, so the old
+        // table is guaranteed to carry every column the v7 table declares.
+        //
+        // The v3 block's CREATE TABLE carries the same new CHECK so vaults
+        // that pass through v3 (fresh vaults, or pre-v3 vaults upgrading in
+        // one pass) never keep the stale constraint. The recreate is one
+        // transaction — the table swap and the user_version stamp commit
+        // together, so a crash mid-recreate rolls back to the old table
+        // and the migration simply runs again on the next open.
+        let fk_was_on: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .map(|v| v != 0)
+            .unwrap_or(true);
+        if fk_was_on {
+            conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        }
+
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch("BEGIN")?;
+
+            conn.execute_batch(
+                "CREATE TABLE engrams_v7 (
+                    id              TEXT PRIMARY KEY,
+                    layer           TEXT NOT NULL CHECK(layer IN ('episodic','semantic','imagined')),
+                    source          TEXT NOT NULL DEFAULT 'interaction' CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','slack','discord','telegram','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
+                    privacy_level   TEXT NOT NULL DEFAULT 'cloud_first' CHECK(privacy_level IN ('strict_local','hybrid','cloud_first','enterprise')),
+                    content         TEXT NOT NULL,
+                    context         TEXT NOT NULL,
+                    strength        REAL NOT NULL DEFAULT 1.0,
+                    valence         REAL NOT NULL DEFAULT 0.0 CHECK(valence BETWEEN -1.0 AND 1.0),
+                    retrievals      INTEGER NOT NULL DEFAULT 0,
+                    imagined        INTEGER NOT NULL DEFAULT 0,
+                    grounded        INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL,
+                    last_retrieved  TEXT,
+                    project         TEXT,
+                    tags            TEXT,
+                    content_hash    TEXT,
+                    scope           TEXT NOT NULL DEFAULT 'moment',
+                    content_type    TEXT NOT NULL DEFAULT 'text',
+                    occurred_at     TEXT,
+                    modified_at     TEXT,
+                    synced_at       TEXT
+                );"
+            )?;
+
+            conn.execute_batch(
+                "INSERT INTO engrams_v7 \
+                 (id, layer, source, privacy_level, content, context, strength, \
+                  valence, retrievals, imagined, grounded, created_at, last_retrieved, \
+                  project, tags, content_hash, scope, content_type, occurred_at, \
+                  modified_at, synced_at) \
+                 SELECT id, layer, source, privacy_level, content, context, strength, \
+                  valence, retrievals, imagined, grounded, created_at, last_retrieved, \
+                  project, tags, content_hash, scope, content_type, occurred_at, \
+                  modified_at, synced_at FROM engrams;"
+            )?;
+
+            conn.execute_batch("DROP TABLE engrams;")?;
+            conn.execute_batch("ALTER TABLE engrams_v7 RENAME TO engrams;")?;
+
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_engrams_layer ON engrams(layer);")?;
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_engrams_source ON engrams(source);")?;
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_engrams_created_at ON engrams(created_at);")?;
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_engrams_imagined ON engrams(imagined);")?;
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_engrams_content_hash ON engrams(content_hash);")?;
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_engrams_modified_at ON engrams(modified_at);")?;
+
+            conn.execute_batch("DROP TABLE IF EXISTS engrams_fts;")?;
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE engrams_fts USING fts5(id, content);"
+            )?;
+            conn.execute_batch(
+                "INSERT INTO engrams_fts(rowid, id, content) SELECT rowid, id, content FROM engrams;"
+            )?;
+
+            conn.execute(
+                &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+                [],
+            )?;
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+
+        if fk_was_on {
+            conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        }
+
+        result?;
     }
 
     Ok(())
@@ -683,13 +778,95 @@ mod tests {
             .unwrap();
         assert_eq!(synced, "2026-08-10T00:00:00Z");
 
-        // Schema version bumped to 6
+        // Schema version bumped to current (CURRENT_SCHEMA_VERSION)
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         // Idempotent
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+    }
+
+    /// Pre-v7 vault (user_version 6, old source CHECK): migrate() must
+    /// recreate the table with slack/discord/telegram in the CHECK, keep
+    /// every row and column (including synced_at), bump to user_version 7,
+    /// and stay idempotent on re-run.
+    #[test]
+    fn create_tables_then_migrate_upgrades_pre_v7_vault() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+
+        // Simulate a v6 vault: every v6 column, the pre-v7 source CHECK.
+        conn.execute_batch(
+            "CREATE TABLE engrams (
+                id TEXT PRIMARY KEY,
+                layer TEXT NOT NULL,
+                source TEXT NOT NULL CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
+                privacy_level TEXT NOT NULL DEFAULT 'cloud_first',
+                content TEXT NOT NULL,
+                context TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 1.0,
+                valence REAL NOT NULL DEFAULT 0.0,
+                retrievals INTEGER NOT NULL DEFAULT 0,
+                imagined INTEGER NOT NULL DEFAULT 0,
+                grounded INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_retrieved TEXT,
+                project TEXT,
+                tags TEXT,
+                scope TEXT NOT NULL DEFAULT 'moment',
+                content_type TEXT NOT NULL DEFAULT 'text',
+                occurred_at TEXT,
+                content_hash TEXT,
+                modified_at TEXT,
+                synced_at TEXT
+            );"
+        ).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at, modified_at, synced_at) \
+             VALUES ('m1', 'episodic', 'chat', 'old note', '{}', '2026-08-01T00:00:00Z', '2026-08-10T00:00:00Z', '2026-08-11T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        // Rows survive the recreate with every column intact.
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT source, modified_at, synced_at FROM engrams WHERE id = 'm1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("chat".to_string(), "2026-08-10T00:00:00Z".to_string(), "2026-08-11T00:00:00Z".to_string()));
+
+        // The new CHECK accepts the chat-platform sources…
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at) \
+             VALUES ('m2', 'episodic', 'telegram', 'tg note', '{}', '2026-09-05T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // …and still rejects junk.
+        assert!(
+            conn.execute(
+                "INSERT INTO engrams (id, layer, source, content, context, created_at) \
+                 VALUES ('m3', 'episodic', 'bogus', 'junk', '{}', '2026-09-05T00:00:00Z')",
+                [],
+            )
+            .is_err()
+        );
+
+        // Schema version bumped to 7; re-running both is idempotent.
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
         create_tables(&conn).unwrap();
         migrate(&conn).unwrap();
     }

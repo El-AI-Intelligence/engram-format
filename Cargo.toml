@@ -1,6 +1,6 @@
 [package]
 name = "axiom-engram"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "The Engram encryption & storage format — encrypted-at-rest vault, FTS5 + vector retrieval, and the end-to-end encrypted sync wire format."
 authors = ["El-AI-Intelligence"]

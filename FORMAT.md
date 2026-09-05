@@ -80,7 +80,7 @@ Tracked via `PRAGMA user_version`. All tables are created idempotently
 |---|---|---|
 | `id` | TEXT PK | UUID v4 |
 | `layer` | TEXT | `episodic` \| `semantic` \| `imagined` |
-| `source` | TEXT | `interaction` \| `sensor` \| `consolidation` \| `imagined` \| `chat` \| `window` \| `mic` \| `agent` \| `research` \| `system` \| `user` \| `observation` \| `ai-session` \| `ai-tool` |
+| `source` | TEXT | `interaction` \| `sensor` \| `consolidation` \| `imagined` \| `chat` \| `slack` \| `discord` \| `telegram` \| `window` \| `mic` \| `agent` \| `research` \| `system` \| `user` \| `observation` \| `ai-session` \| `ai-tool` |
 | `privacy_level` | TEXT | `strict_local` \| `hybrid` \| `cloud_first` \| `enterprise` |
 | `content` | TEXT | the memory text |
 | `context` | TEXT | capture context |
@@ -135,6 +135,7 @@ excluded from the default recall surface.
 | v3 → v4 | 2026-08-13 | `content_hash` + `app_metrics` |
 | v4 → v5 | 2026-08-13 | `modified_at` |
 | v5 → v6 | 2026-08-14 | `synced_at` |
+| v6 → v7 | 2026-09-05 | `slack`, `discord`, `telegram` added to `source` constraint |
 
 Column-adding migrations are idempotent "ensure" blocks so a vault that
 crashed mid-migration cannot claim a version it does not have.
