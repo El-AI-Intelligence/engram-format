@@ -133,6 +133,22 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             deleted_at  TEXT NOT NULL
         );
 
+        -- Access audit ledger (schema v9). One row per retrieval/export:
+        -- which client label got which memory when. Deliberately NO foreign
+        -- key to engrams — the audit trail must survive deletion. Stores ids
+        -- and the memory's content hash, never content.
+        CREATE TABLE IF NOT EXISTS access_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id    TEXT NOT NULL,
+            op           TEXT NOT NULL CHECK(op IN ('get','search_hit','export')),
+            client       TEXT NOT NULL DEFAULT 'http',
+            content_hash TEXT,
+            at           TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_access_events_at ON access_events(at);
+        CREATE INDEX IF NOT EXISTS idx_access_events_memory ON access_events(memory_id);
+
         -- FTS5 virtual table for full-text search.
         -- FTS sync is managed in Rust code (store.rs) rather than SQLite triggers
         -- because the FTS 'delete' command is incompatible with SQLCipher's
@@ -150,7 +166,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Apply schema migrations for columns added after the initial release.
 ///
 /// Current schema version. Increment this when adding new migrations below.
-const CURRENT_SCHEMA_VERSION: i32 = 8;
+const CURRENT_SCHEMA_VERSION: i32 = 9;
 
 /// Versioned schema migrations using SQLite's `PRAGMA user_version`.
 ///
@@ -174,6 +190,9 @@ const CURRENT_SCHEMA_VERSION: i32 = 8;
 ///   v7 → v8: Added tombstones table — deletion tombstones move from the
 ///            tombstones.jsonl sidecar file into the vault DB so a delete and
 ///            its tombstone commit atomically (2026-09-07)
+///   v8 → v9: Added access_events table — the retrieval/export audit ledger
+///            (who got which memory when; ids + hashes, never content)
+///            (2026-09-07)
 #[allow(clippy::needless_return)]
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.query_row(
@@ -607,6 +626,33 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    // v9: access_events — the retrieval/export audit ledger. Same ungated
+    // idempotent "ensure" pattern as v8.
+    {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS access_events (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id    TEXT NOT NULL,
+                op           TEXT NOT NULL CHECK(op IN ('get','search_hit','export')),
+                client       TEXT NOT NULL DEFAULT 'http',
+                content_hash TEXT,
+                at           TEXT NOT NULL
+            );"
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_access_events_at ON access_events(at);"
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_access_events_memory ON access_events(memory_id);"
+        )?;
+        conn.execute(
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+            [],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 #[cfg(test)]
@@ -954,6 +1000,18 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+
+        // The v9 access_events table exists and accepts rows.
+        conn.execute(
+            "INSERT INTO access_events (memory_id, op, client, at) \
+             VALUES ('m1', 'get', 'http', '2026-09-07T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let ev: i64 = conn
+            .query_row("SELECT COUNT(*) FROM access_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ev, 1);
 
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

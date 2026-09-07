@@ -58,6 +58,43 @@ pub struct NearDuplicate {
     pub similarity: f64,
 }
 
+// ── Access audit ledger (schema v9) ─────────────────────────────────────────
+
+/// What kind of access an [`AccessEvent`] records. The audit trail stores
+/// ids and hashes — never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessOp {
+    /// A single memory fetched directly (GET /memories/{id}).
+    Get,
+    /// A memory surfaced in a search result set.
+    SearchHit,
+    /// A memory exported — included in an assembled LLM context window or
+    /// a vault export.
+    Export,
+}
+
+impl AccessOp {
+    /// Wire name used in the `access_events.op` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccessOp::Get => "get",
+            AccessOp::SearchHit => "search_hit",
+            AccessOp::Export => "export",
+        }
+    }
+}
+
+/// One row of the access audit ledger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessEvent {
+    pub id: i64,
+    pub memory_id: String,
+    pub op: String,
+    pub client: String,
+    pub content_hash: Option<String>,
+    pub at: String,
+}
+
 /// Quarantine scope for search/list queries.
 ///
 /// "Quarantined" = `imagined && !grounded` — noise-marked rows and ungrounded
@@ -1755,6 +1792,82 @@ impl EngramStore {
             rusqlite::params![id, deleted_at],
         )?;
         Ok(())
+    }
+
+    /// Record one access event in the audit ledger. `content_hash` is the
+    /// memory's own hash at access time (never content).
+    pub async fn record_access(
+        &self,
+        memory_id: &str,
+        op: AccessOp,
+        client: &str,
+        content_hash: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO access_events (memory_id, op, client, content_hash, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![memory_id, op.as_str(), client, content_hash, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Record a batch of access events in one transaction (search result
+    /// sets, assembled context windows).
+    pub async fn record_access_batch(
+        &self,
+        events: &[(String, AccessOp, String, Option<String>)],
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction()?;
+        let at = Utc::now().to_rfc3339();
+        for (memory_id, op, client, content_hash) in events {
+            tx.execute(
+                "INSERT INTO access_events (memory_id, op, client, content_hash, at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![memory_id, op.as_str(), client, content_hash, at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Events strictly after `since` (RFC3339), newest first. This is the
+    /// integrator cursor: "which memories did my agent touch since X".
+    pub async fn list_access_events_since(&self, since: &str, limit: usize) -> Result<Vec<AccessEvent>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, memory_id, op, client, content_hash, at FROM access_events \
+             WHERE at > ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![since, limit as i64], |row| {
+            Ok(AccessEvent {
+                id: row.get(0)?,
+                memory_id: row.get(1)?,
+                op: row.get(2)?,
+                client: row.get(3)?,
+                content_hash: row.get(4)?,
+                at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Tombstones strictly after `since` (RFC3339), newest first — the
+    /// deletion cursor: "which memories were deleted since X".
+    pub async fn list_tombstones_since(&self, since: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, deleted_at FROM tombstones WHERE deleted_at > ?1 \
+             ORDER BY deleted_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![since, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Get all outgoing links from an engram
@@ -3643,5 +3756,100 @@ mod tests {
         let tombstones = store.list_tombstones().await.unwrap();
         assert_eq!(tombstones.len(), 1, "only the un-accepted tombstone remains");
         assert_eq!(tombstones[0].0, b.id);
+    }
+
+    // ── Access audit ledger (schema v9) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn access_events_record_and_cursor_pages_newest_first() {
+        let (store, _dir) = test_store().await;
+        let e = make_engram("audited memory content");
+        let id = e.id.clone();
+        store.write(&e).await.unwrap();
+
+        store.record_access(&id, AccessOp::Get, "http", None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let cutoff = chrono::Utc::now().to_rfc3339();
+        store
+            .record_access(&id, AccessOp::Export, "engram-chat", None)
+            .await
+            .unwrap();
+
+        // Cursor: only events strictly after the cutoff.
+        let since = store.list_access_events_since(&cutoff, 10).await.unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].op, "export");
+        assert_eq!(since[0].client, "engram-chat");
+        assert_eq!(since[0].memory_id, id);
+
+        // No cutoff: everything, newest first.
+        let all = store
+            .list_access_events_since("1970-01-01T00:00:00Z", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].op, "export", "newest first");
+        assert_eq!(all[1].op, "get");
+    }
+
+    #[tokio::test]
+    async fn access_event_batch_writes_atomically() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("batch candidate one");
+        let b = make_engram("batch candidate two");
+        store.write(&a).await.unwrap();
+        store.write(&b).await.unwrap();
+
+        let events = vec![
+            (a.id.clone(), AccessOp::SearchHit, "http".to_string(), None),
+            (b.id.clone(), AccessOp::SearchHit, "http".to_string(), None),
+        ];
+        store.record_access_batch(&events).await.unwrap();
+
+        let all = store
+            .list_access_events_since("1970-01-01T00:00:00Z", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let mut ids: Vec<String> = all.into_iter().map(|e| e.memory_id).collect();
+        ids.sort();
+        let mut want = vec![a.id, b.id];
+        want.sort();
+        assert_eq!(ids, want);
+    }
+
+    #[tokio::test]
+    async fn access_events_survive_memory_deletion() {
+        let (store, _dir) = test_store().await;
+        let e = make_engram("trail must survive deletion");
+        let id = e.id.clone();
+        store.write(&e).await.unwrap();
+        store.record_access(&id, AccessOp::Get, "http", None).await.unwrap();
+        store.delete(&id).await.unwrap();
+
+        // The row is gone but the audit trail is not (no FK by design).
+        let all = store
+            .list_access_events_since("1970-01-01T00:00:00Z", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].memory_id, id);
+    }
+
+    #[tokio::test]
+    async fn tombstone_cursor_pages_deletions_newest_first() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("first deleted memory");
+        store.write(&a).await.unwrap();
+        store.delete(&a.id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let cutoff = chrono::Utc::now().to_rfc3339();
+        let b = make_engram("second deleted memory");
+        store.write(&b).await.unwrap();
+        store.delete(&b.id).await.unwrap();
+
+        let since = store.list_tombstones_since(&cutoff, 10).await.unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].0, b.id, "only the deletion after the cursor");
     }
 }
