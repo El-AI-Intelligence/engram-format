@@ -1584,25 +1584,51 @@ impl EngramStore {
         Ok(())
     }
 
-    /// Delete an engram by ID (cascade-deletes its links).
+    /// Delete an engram by ID (cascade-deletes its links, embeddings,
+    /// evidence and annotations via ON DELETE CASCADE).
+    ///
     /// FTS index is cleaned up manually via regular DELETE (normal FTS5 content
     /// tables support standard DML; the special 'delete' INSERT command is only
     /// for external-content / contentless tables and is broken under SQLCipher).
+    ///
+    /// The whole delete runs in one transaction: FTS cleanup, row delete and
+    /// the sync tombstone commit together, so a crash or an FTS failure can
+    /// neither leave ghost search rows behind nor lose the tombstone that
+    /// tells replicas to delete too.
     pub async fn delete(&self, id: &str) -> Result<()> {
+        self.delete_inner(id, true).await
+    }
+
+    /// Delete an engram without recording a tombstone. Used when applying a
+    /// remote tombstone — the deletion originated on another device and the
+    /// relay already has it, so recording one here would echo it back.
+    pub async fn delete_without_tombstone(&self, id: &str) -> Result<()> {
+        self.delete_inner(id, false).await
+    }
+
+    async fn delete_inner(&self, id: &str, tombstone: bool) -> Result<()> {
         let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction()?;
         // Delete from FTS index first (while the engram row still exists,
         // so FTS5 can resolve the content for token cleanup).
-        conn.execute(
+        tx.execute(
             "DELETE FROM engrams_fts WHERE id = ?1",
             rusqlite::params![id],
-        ).ok();
-        let affected = conn.execute(
+        )?;
+        let affected = tx.execute(
             "DELETE FROM engrams WHERE id = ?1",
             rusqlite::params![id],
         )?;
         if affected == 0 {
             return Err(EngramError::NotFound(id.to_string()));
         }
+        if tombstone {
+            tx.execute(
+                "INSERT INTO tombstones (id, deleted_at) VALUES (?1, ?2)",
+                rusqlite::params![id, Utc::now().to_rfc3339()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1665,16 +1691,70 @@ impl EngramStore {
 
         let count = ids.len();
 
-        // Delete from FTS index
+        // One transaction: FTS cleanup, row deletes and tombstones commit
+        // together — a failure anywhere rolls the whole purge back.
+        let tx = conn.unchecked_transaction()?;
+
+        // Delete from FTS index (while the rows still exist, so FTS5 can
+        // resolve the content for token cleanup). Errors are loud: a partial
+        // FTS cleanup would leave ghost search rows behind.
         for id in &ids {
-            conn.execute("DELETE FROM engrams_fts WHERE id = ?1", rusqlite::params![id]).ok();
+            tx.execute("DELETE FROM engrams_fts WHERE id = ?1", rusqlite::params![id])?;
         }
 
         // Delete from main table
         let del_sql = format!("DELETE FROM engrams WHERE {}", where_clause);
-        conn.execute(&del_sql, rusqlite::params_from_iter(&param_refs))?;
+        tx.execute(&del_sql, rusqlite::params_from_iter(&param_refs))?;
+
+        // Tombstone every purged memory so replicas purge it too.
+        let now = Utc::now().to_rfc3339();
+        for id in &ids {
+            tx.execute(
+                "INSERT INTO tombstones (id, deleted_at) VALUES (?1, ?2)",
+                rusqlite::params![id, now],
+            )?;
+        }
+
+        tx.commit()?;
 
         Ok(count)
+    }
+
+    /// List pending deletion tombstones as `(id, deleted_at)` pairs, for the
+    /// sync loop to push to the relay. Rows are cleared once the relay has
+    /// accepted the push (see [`EngramStore::clear_tombstones`]).
+    pub async fn list_tombstones(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare("SELECT id, deleted_at FROM tombstones")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Remove tombstones the relay has accepted, so they are not re-pushed.
+    pub async fn clear_tombstones(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction()?;
+        for id in ids {
+            tx.execute("DELETE FROM tombstones WHERE id = ?1", rusqlite::params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert a tombstone directly. Used for the daemon's one-time import of
+    /// tombstones recorded by older versions in the `tombstones.jsonl`
+    /// sidecar file. `INSERT OR IGNORE` — a row already recorded by a
+    /// transactional delete wins.
+    pub async fn record_tombstone(&self, id: &str, deleted_at: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO tombstones (id, deleted_at) VALUES (?1, ?2)",
+            rusqlite::params![id, deleted_at],
+        )?;
+        Ok(())
     }
 
     /// Get all outgoing links from an engram
@@ -1989,22 +2069,35 @@ impl EngramStore {
 
     /// Promote frequently-retrieved episodic engrams to semantic, prune near-zero imagined engrams.
     /// Returns (promoted, pruned) counts.
+    ///
+    /// The prune runs in one transaction: FTS cleanup, tombstones and row
+    /// deletes commit together — a failure rolls the whole consolidation back,
+    /// and replicas get told about the pruned rows.
     pub async fn apply_weekly_consolidation(&self) -> Result<(i32, i32)> {
         let conn = self.conn.lock().await;
-        let promoted = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let promoted = tx.execute(
             "UPDATE engrams SET layer = 'semantic', source = 'consolidation' WHERE layer = 'episodic' AND retrievals >= 5",
             [],
         )? as i32;
-        // Clean up FTS entries before bulk-deleting
-        conn.execute(
+        // Clean up FTS entries before bulk-deleting (loud — a partial FTS
+        // cleanup would leave ghost search rows behind).
+        tx.execute(
             "DELETE FROM engrams_fts WHERE id IN \
              (SELECT id FROM engrams WHERE strength < 0.05 AND imagined = 1)",
             [],
-        ).ok();
-        let pruned = conn.execute(
+        )?;
+        // Tombstone pruned rows so replicas prune them too.
+        tx.execute(
+            "INSERT INTO tombstones (id, deleted_at) \
+             SELECT id, ?1 FROM engrams WHERE strength < 0.05 AND imagined = 1",
+            rusqlite::params![Utc::now().to_rfc3339()],
+        )?;
+        let pruned = tx.execute(
             "DELETE FROM engrams WHERE strength < 0.05 AND imagined = 1",
             [],
         )? as i32;
+        tx.commit()?;
         Ok((promoted, pruned))
     }
 
@@ -3450,5 +3543,105 @@ mod tests {
         assert_eq!(links.len(), 1, "only the link with a local target persists");
         assert_eq!(links[0].target_id, bid);
         assert_eq!(links[0].link_type, LinkType::Associative);
+    }
+
+    // ── Delete + tombstones (schema v8) ─────────────────────────────────────
+
+    /// Same-crate access to the FTS index — asserts ghost-row cleanup, which
+    /// is invisible through the public search API (a ghost row only matters
+    /// once the content it shadows is gone).
+    async fn fts_rows(store: &EngramStore, id: &str) -> i64 {
+        let conn = store.conn.lock().await;
+        conn.query_row(
+            "SELECT COUNT(*) FROM engrams_fts WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_removes_row_and_fts_and_records_tombstone() {
+        let (store, _dir) = test_store().await;
+        let e = make_engram("delete this captured memory");
+        let id = e.id.clone();
+        store.write(&e).await.unwrap();
+        assert_eq!(fts_rows(&store, &id).await, 1, "write populates FTS");
+
+        store.delete(&id).await.unwrap();
+
+        assert!(matches!(store.get(&id).await, Err(EngramError::NotFound(_))));
+        assert_eq!(fts_rows(&store, &id).await, 0, "no ghost FTS rows after delete");
+        let tombstones = store.list_tombstones().await.unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].0, id);
+        assert!(!tombstones[0].1.is_empty(), "deleted_at is set");
+    }
+
+    #[tokio::test]
+    async fn delete_missing_id_errors_and_leaves_no_tombstone() {
+        let (store, _dir) = test_store().await;
+        let err = store.delete("does-not-exist").await.expect_err("missing id must error");
+        assert!(matches!(err, EngramError::NotFound(_)));
+        assert!(store.list_tombstones().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_without_tombstone_removes_everything_but_records_nothing() {
+        let (store, _dir) = test_store().await;
+        let e = make_engram("remote tombstone target memory");
+        let id = e.id.clone();
+        store.write(&e).await.unwrap();
+
+        store.delete_without_tombstone(&id).await.unwrap();
+
+        assert!(matches!(store.get(&id).await, Err(EngramError::NotFound(_))));
+        assert_eq!(fts_rows(&store, &id).await, 0);
+        assert!(store.list_tombstones().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_tombstones_each_deleted_row_and_cleans_fts() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram_sourced("purge candidate one", EngramSource::Research);
+        let b = make_engram_sourced("purge candidate two", EngramSource::Research);
+        let c = make_engram("keep this one");
+        store.write(&a).await.unwrap();
+        store.write(&b).await.unwrap();
+        store.write(&c).await.unwrap();
+
+        let count = store
+            .purge_by_criteria(Some("research"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        assert!(store.get(&c.id).await.is_ok(), "non-matching row survives");
+        assert_eq!(fts_rows(&store, &c.id).await, 1);
+        assert_eq!(fts_rows(&store, &a.id).await, 0);
+        assert_eq!(fts_rows(&store, &b.id).await, 0);
+
+        let tombstones = store.list_tombstones().await.unwrap();
+        let mut ids: Vec<String> = tombstones.into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        let mut want = vec![a.id, b.id];
+        want.sort();
+        assert_eq!(ids, want, "one tombstone per purged row");
+    }
+
+    #[tokio::test]
+    async fn clear_tombstones_removes_only_listed_ids() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("first deleted memory");
+        let b = make_engram("second deleted memory");
+        store.write(&a).await.unwrap();
+        store.write(&b).await.unwrap();
+        store.delete(&a.id).await.unwrap();
+        store.delete(&b.id).await.unwrap();
+
+        store.clear_tombstones(&[a.id.clone()]).await.unwrap();
+        let tombstones = store.list_tombstones().await.unwrap();
+        assert_eq!(tombstones.len(), 1, "only the un-accepted tombstone remains");
+        assert_eq!(tombstones[0].0, b.id);
     }
 }

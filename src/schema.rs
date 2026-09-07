@@ -124,6 +124,15 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             last_checked_at TEXT
         );
 
+        -- Deletion tombstones (schema v8). Written in the same transaction as
+        -- the delete so a crash can't lose a tombstone and resurrect a memory
+        -- from a sync replica. Consumers (engramd sync) clear rows once the
+        -- relay has accepted the tombstone push.
+        CREATE TABLE IF NOT EXISTS tombstones (
+            id          TEXT PRIMARY KEY,
+            deleted_at  TEXT NOT NULL
+        );
+
         -- FTS5 virtual table for full-text search.
         -- FTS sync is managed in Rust code (store.rs) rather than SQLite triggers
         -- because the FTS 'delete' command is incompatible with SQLCipher's
@@ -141,7 +150,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Apply schema migrations for columns added after the initial release.
 ///
 /// Current schema version. Increment this when adding new migrations below.
-const CURRENT_SCHEMA_VERSION: i32 = 7;
+const CURRENT_SCHEMA_VERSION: i32 = 8;
 
 /// Versioned schema migrations using SQLite's `PRAGMA user_version`.
 ///
@@ -162,6 +171,9 @@ const CURRENT_SCHEMA_VERSION: i32 = 7;
 ///   v4 → v5: Added modified_at so edits re-push to sync (2026-08-13)
 ///   v5 → v6: Added synced_at for the per-memory push cursor (2026-08-14)
 ///   v6 → v7: Added slack, discord, telegram to source CHECK constraint (2026-09-05)
+///   v7 → v8: Added tombstones table — deletion tombstones move from the
+///            tombstones.jsonl sidecar file into the vault DB so a delete and
+///            its tombstone commit atomically (2026-09-07)
 #[allow(clippy::needless_return)]
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.query_row(
@@ -574,6 +586,27 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         result?;
     }
 
+    // v8: tombstones table — deletion tombstones move from the
+    // tombstones.jsonl sidecar into the vault DB so a delete and its
+    // tombstone commit atomically. Same idempotent "ensure" pattern as
+    // v4/v5/v6: not gated on `version < 8` so a vault that crashed
+    // mid-migration can't claim v8 without the table. Existing sidecar
+    // files are imported by the daemon at startup (one-time).
+    {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tombstones (
+                id          TEXT PRIMARY KEY,
+                deleted_at  TEXT NOT NULL
+            );"
+        )?;
+        conn.execute(
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+            [],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 #[cfg(test)]
@@ -862,12 +895,77 @@ mod tests {
             .is_err()
         );
 
-        // Schema version bumped to 7; re-running both is idempotent.
+        // Schema version bumped to current; re-running both is idempotent.
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         create_tables(&conn).unwrap();
         migrate(&conn).unwrap();
+    }
+
+    /// v8: migrate() must create the tombstones table on a pre-v8 vault,
+    /// bump the version, and stay idempotent on re-run.
+    #[test]
+    fn migrate_adds_tombstones_table() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+
+        // Simulate a v7 vault: every v7 column and the v7 source CHECK,
+        // but no tombstones table.
+        conn.execute_batch(
+            "CREATE TABLE engrams (
+                id TEXT PRIMARY KEY,
+                layer TEXT NOT NULL,
+                source TEXT NOT NULL CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','slack','discord','telegram','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
+                privacy_level TEXT NOT NULL DEFAULT 'cloud_first',
+                content TEXT NOT NULL,
+                context TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 1.0,
+                valence REAL NOT NULL DEFAULT 0.0,
+                retrievals INTEGER NOT NULL DEFAULT 0,
+                imagined INTEGER NOT NULL DEFAULT 0,
+                grounded INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_retrieved TEXT,
+                project TEXT,
+                tags TEXT,
+                scope TEXT NOT NULL DEFAULT 'moment',
+                content_type TEXT NOT NULL DEFAULT 'text',
+                occurred_at TEXT,
+                content_hash TEXT,
+                modified_at TEXT,
+                synced_at TEXT
+            );"
+        ).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        // The tombstones table exists and accepts rows.
+        conn.execute(
+            "INSERT INTO tombstones (id, deleted_at) VALUES ('m1', '2026-09-07T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        // Idempotent
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 1, "re-migrate does not duplicate or clear rows");
     }
 }
