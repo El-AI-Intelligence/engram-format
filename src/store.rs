@@ -3713,6 +3713,61 @@ mod tests {
         assert!(store.list_tombstones().await.unwrap().is_empty());
     }
 
+    /// Gap-4 regression: deleting a source leaves no stale consolidation
+    /// outputs. Promotion is in-place (the row itself becomes semantic), and
+    /// the only rows that reference it — links and embeddings — must cascade
+    /// with it. coherence_state/consolidation_runs hold no memory ids by
+    /// design, so there is nothing else to mark stale.
+    #[tokio::test]
+    async fn delete_cascades_to_links_and_embeddings_after_consolidation() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("source memory for consolidation cascade");
+        let b = make_engram("target memory for consolidation cascade");
+        store.write(&a).await.unwrap();
+        store.write(&b).await.unwrap();
+        store
+            .link(&a.id, &b.id, 0.7, LinkType::Associative)
+            .await
+            .unwrap();
+        store.store_embedding(&a.id, &vec![0.1; 8]).await.unwrap();
+
+        // Promote a to semantic exactly the way weekly consolidation does:
+        // five retrievals push it over the promotion threshold.
+        for _ in 0..5 {
+            let _ = store.get(&a.id).await.unwrap();
+        }
+        let (promoted, pruned) = store.apply_weekly_consolidation().await.unwrap();
+        assert_eq!(promoted, 1, "five retrievals must promote the episodic row");
+        assert_eq!(pruned, 0, "consolidation must not prune this test's rows");
+        assert_eq!(store.get(&a.id).await.unwrap().layer, EngramLayer::Semantic);
+
+        store.delete(&a.id).await.unwrap();
+
+        let conn = store.conn.lock().await;
+        let links: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engram_links WHERE source_id = ?1 OR target_id = ?1",
+                rusqlite::params![a.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(links, 0, "links referencing the deleted memory must cascade");
+        let embeddings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engram_embeddings WHERE engram_id = ?1",
+                rusqlite::params![a.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            embeddings, 0,
+            "embeddings referencing the deleted memory must cascade"
+        );
+        drop(conn);
+        assert_eq!(fts_rows(&store, &a.id).await, 0);
+        assert_eq!(store.list_tombstones().await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn purge_tombstones_each_deleted_row_and_cleans_fts() {
         let (store, _dir) = test_store().await;
