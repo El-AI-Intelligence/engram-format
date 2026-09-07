@@ -34,6 +34,7 @@ pub use store::TemporalPattern;
 pub use store::WriteOutcome;
 pub use store::NearDuplicate;
 pub use store::QuarantineFilter;
+pub use store::{AccessEvent, AccessOp};
 pub use schema::create_tables;
 pub use schema::migrate;
 pub use entry::{MemoryEntry, MemoryId, MemoryLayer, MemoryScope, ContentType, MemorySource, MemoryLink, EvidenceRef};
