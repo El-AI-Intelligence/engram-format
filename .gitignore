@@ -27,3 +27,6 @@ sdks/python-engramd/dist/
 # Python cache
 __pycache__/
 *.pyc
+
+# wasm-pack build output (generated)
+wasm/pkg/

@@ -1,0 +1,10 @@
+{
+  "vault_id": "11111111-1111-1111-1111-111111111111",
+  "memory_id": "mem_0000000000000000",
+  "device_id": "dev-1",
+  "vector_clock": 42,
+  "ciphertext": "SGVsbG8=",
+  "hmac": "QUJD",
+  "created_at": "2026-09-07T02:30:00Z",
+  "deleted": false
+}

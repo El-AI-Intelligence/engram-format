@@ -1,0 +1,26 @@
+{
+  "name": "axiom-engram",
+  "version": "0.1.5",
+  "description": "Official Engram format for JavaScript — parse, validate, and filter memory entries and sync blobs (WASM, compiled from the axiom-engram Rust crate)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/El-AI-Intelligence/engram-format"
+  },
+  "keywords": [
+    "engram",
+    "memory",
+    "storage-format",
+    "encryption",
+    "sync",
+    "wasm"
+  ],
+  "author": "El-AI-Intelligence",
+  "private": true,
+  "scripts": {
+    "build": "wasm-pack build .. --release --target web --out-dir wasm/pkg -- --no-default-features --features wasm",
+    "fix-package": "node fix-package.js",
+    "pack": "npm run build && npm run fix-package",
+    "smoke": "npm run pack && node smoke.mjs"
+  }
+}

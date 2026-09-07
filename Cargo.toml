@@ -10,19 +10,36 @@ readme = "README.md"
 keywords = ["memory", "storage-format", "encryption", "sqlcipher", "vector-search"]
 categories = ["database-implementations", "cryptography"]
 
+[lib]
+# cdylib lets wasm-pack build the wasm crate for the npm package; rlib keeps
+# the normal library artifact for cargo consumers (crates.io, the daemon).
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-tokio = { version = "1.40", features = ["full"] }
+# ── Pure format core (the wasm-compatible subset) ────────────────────────────
+# entry/engram/sync/noise: serde wire types, noise filtering, sync envelopes.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
-async-trait = "0.1"
-argon2 = "0.5"
-parking_lot = "0.12"
 tracing = "0.1"
+
+# ── Storage engine (native only; gated behind the `storage` feature) ─────────
+tokio = { version = "1.40", features = ["full"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
+async-trait = { version = "0.1", optional = true }
+argon2 = { version = "0.5", optional = true }
+parking_lot = { version = "0.12", optional = true }
+
+# ── wasm bindings (the `wasm` feature; wasm-bindgen API in src/wasm.rs) ──────
+wasm-bindgen = { version = "0.2", optional = true }
+# uuid's v4 (Uuid::new_v4 in MemoryId::generate) needs an RNG; getrandom's
+# `wasm_js` feature routes it through WebCrypto on wasm32-unknown-unknown.
+# The optional dep only exists so the `wasm` feature can force that route on
+# the same major (0.4) that uuid 1.26 resolves.
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 
 # ONNX Runtime for zero-config local embeddings (all-MiniLM-L6-v2, 384-dim)
 # Candle: pure-Rust ML framework for zero-config BERT embeddings
@@ -39,5 +56,13 @@ tempfile = "3"
 tokio = { version = "1.40", features = ["full"] }
 
 [features]
-default = []
-onnx-embed = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+default = ["storage"]
+# Native storage engine: SQLCipher vault, tokio runtime, key derivation.
+storage = ["dep:tokio", "dep:rusqlite", "dep:async-trait", "dep:argon2", "dep:parking_lot"]
+onnx-embed = ["storage", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+# Browser bindings: pure format core only (no sqlite, no tokio). Build with
+#   cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
+# chrono/wasmbind routes Utc::now() through js_sys::Date (entry::MemoryEntry::new
+# timestamps); uuid/js is uuid 1.26's wasm RNG route; dep:getrandom forces
+# getrandom's `wasm_js` feature for the copy uuid's v4/rng still compiles.
+wasm = ["dep:wasm-bindgen", "dep:getrandom", "chrono/wasmbind", "uuid/js"]

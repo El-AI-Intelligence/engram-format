@@ -1,0 +1,61 @@
+name: Publish axiom-engram to npm
+
+# Publishes the wasm package (wasm/pkg, built by wasm-pack) to npm via
+# Trusted Publishing (OIDC): no npm token is stored anywhere; GitHub Actions
+# mints a short-lived registry credential from the workflow identity, and npm
+# records a provenance attestation on the published package.
+#
+# Manual trigger only for now (Actions tab -> "Run workflow"). The package
+# version comes from Cargo.toml (wasm-pack copies it into the manifest), so
+# bump the crate version before running.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC identity for npm Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing's OIDC token exchange needs npm >= 11.5.1;
+      # the npm 10.x bundled with Node 22 signs provenance but never
+      # exchanges the token, so the PUT lands anonymous and npm returns
+      # the misleading E404 "not in this registry" (same fix as the
+      # engram repo's publish-npm.yml).
+      - run: npm install -g npm@11
+
+      - name: Install Rust wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # Each `run` step is a fresh shell; put cargo bin on PATH for the
+      # steps that need wasm-pack.
+      - name: Add cargo bin to PATH
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Build wasm package
+        working-directory: wasm
+        run: npm run pack
+
+      - name: Smoke test the built package
+        working-directory: wasm
+        run: node smoke.mjs
+
+      # --provenance is kept: npm rejects provenance bundles only from
+      # PRIVATE source repos (E422), and this repo is public. The OIDC
+      # exchange still authenticates the publish either way.
+      - name: Publish to npm
+        working-directory: wasm/pkg
+        run: npm publish --access public --provenance

@@ -15,32 +15,63 @@
 //!
 //! All layers implement `MemoryBackend`, so callers can work against the trait
 //! and swap implementations without code changes.
+//!
+//! ## Features
+//!
+//! - `storage` (default): the native storage engine — SQLCipher vault
+//!   (`store`, `schema`, `adapter`), tokio, QemCache, embeddings.
+//! - `onnx-embed`: candle-based local embeddings (implies `storage`).
+//! - `wasm`: wasm-bindgen API over the pure format core (`entry`, `engram`,
+//!   `sync`, `noise`) for browsers — no sqlite, no tokio.
 
 pub mod sync;
-pub mod adapter;
-pub mod schema;
-pub mod store;
-pub mod engram;
 pub mod entry;
-pub mod r#trait;
-pub mod qem;
-pub mod embed;
+pub mod engram;
 pub mod noise;
 
+#[cfg(feature = "storage")]
+pub mod schema;
+#[cfg(feature = "storage")]
+pub mod store;
+#[cfg(feature = "storage")]
+pub mod adapter;
+#[cfg(feature = "storage")]
+pub mod r#trait;
+#[cfg(feature = "storage")]
+pub mod qem;
+#[cfg(feature = "storage")]
+pub mod embed;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 pub use engram::{Engram, EngramLayer, EngramSource, EngramLink, PrivacyLevel, CoherenceState, CharacterTopology, Goal, GoalStatus, ConsolidationRun, LinkType};
+#[cfg(feature = "storage")]
 pub use store::EngramStore;
+#[cfg(feature = "storage")]
 pub use store::LinkInferenceConfig;
+#[cfg(feature = "storage")]
 pub use store::TemporalPattern;
+#[cfg(feature = "storage")]
 pub use store::WriteOutcome;
+#[cfg(feature = "storage")]
 pub use store::NearDuplicate;
+#[cfg(feature = "storage")]
 pub use store::QuarantineFilter;
+#[cfg(feature = "storage")]
 pub use store::{AccessEvent, AccessOp};
+#[cfg(feature = "storage")]
 pub use schema::create_tables;
+#[cfg(feature = "storage")]
 pub use schema::migrate;
 pub use entry::{MemoryEntry, MemoryId, MemoryLayer, MemoryScope, ContentType, MemorySource, MemoryLink, EvidenceRef};
+#[cfg(feature = "storage")]
 pub use r#trait::{MemoryBackend, Query, SortKey, DecayReport, ConsolidationReport};
+#[cfg(feature = "storage")]
 pub use qem::{QemCache, QemConfig, QemCode, QemEncoder, NoveltyFilter};
+#[cfg(feature = "storage")]
 pub use adapter::EngramStoreAdapter;
+#[cfg(feature = "storage")]
 pub use embed::{Embedder, NoopEmbedder, should_embed, generate_embeddings_batch};
 #[cfg(feature = "onnx-embed")]
 pub use embed::OnnxEmbedder;
@@ -55,6 +86,7 @@ pub(crate) mod hex {
 
 #[derive(Error, Debug)]
 pub enum EngramError {
+    #[cfg(feature = "storage")]
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("Serialization error: {0}")]
