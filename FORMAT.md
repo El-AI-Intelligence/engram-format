@@ -1,7 +1,7 @@
 # Engram Format Specification
 
 The normative description of the Engram vault (on-disk) and sync (wire)
-formats. Version 1 — schema version 6, sync protocol v5.1.
+formats. Version 1 — schema version 7, sync protocol v5.1.
 
 The reference implementation is the `axiom-engram` crate in this repository.
 Every constant below is taken from that code; where the product (closed
