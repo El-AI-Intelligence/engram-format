@@ -9,7 +9,7 @@ const mod = await import("./pkg/axiom_engram.js");
 mod.initSync({ module: wasm });
 
 // version
-assert.equal(mod.version(), "0.1.5", "version");
+assert.equal(mod.version(), "0.1.6", "version");
 
 // generate_memory_id — WebCrypto/getrandom route. Format matches the native
 // MemoryId::new(): "mem_" + the first 16 chars of the uuid string, which
