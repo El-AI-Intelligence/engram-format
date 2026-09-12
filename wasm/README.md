@@ -23,7 +23,7 @@ import init, {
 
 await init(); // loads the wasm module
 
-version(); // "0.1.5"
+version(); // "0.1.6"
 generate_memory_id(); // "mem_3f9a1c0d4e5b6f7a"
 
 // Parse + validate a MemoryEntry; returns canonical JSON or throws.
