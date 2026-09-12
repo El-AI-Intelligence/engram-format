@@ -1,6 +1,6 @@
 {
   "name": "axiom-engram",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Official Engram format for JavaScript — parse, validate, and filter memory entries and sync blobs (WASM, compiled from the axiom-engram Rust crate)",
   "license": "Apache-2.0",
   "repository": {

@@ -1,7 +1,7 @@
 # Engram Format Specification
 
 The normative description of the Engram vault (on-disk) and sync (wire)
-formats. Version 1 — schema version 7, sync protocol v5.1.
+formats. Version 1 — schema version 9, sync protocol v5.1.
 
 The reference implementation is the `axiom-engram` crate in this repository.
 Every constant below is taken from that code; where the product (closed
@@ -69,7 +69,7 @@ key      = hex( Argon2id( passphrase,
 - Early passphrase vaults used
   `hex( SHA-256( passphrase ‖ ":" ‖ "axiom-engram-vault-v1" ) )`.
 
-## 4. Schema (version 6)
+## 4. Schema (version 9)
 
 Tracked via `PRAGMA user_version`. All tables are created idempotently
 (`IF NOT EXISTS`); migrations are versioned and run exactly once.
@@ -120,6 +120,16 @@ excluded from the default recall surface.
   relationship default `supports`.
 - **`annotations`** — user notes attached to memories.
 - **`saved_searches`** — watchlist queries.
+- **`tombstones`** — (id, deleted_at) deletion tombstones (v8). Written in
+  the same transaction as the delete, so a crash cannot lose a tombstone
+  and resurrect a memory from a sync replica; consumers clear rows once
+  the relay has accepted the tombstone push. Pre-v8 `tombstones.jsonl`
+  sidecar rows are imported one-time at startup.
+- **`access_events`** — (memory_id, op, client, content_hash, at) the
+  access audit ledger (v9). One row per retrieval/export
+  (`get` \| `search_hit` \| `export`) recording which client got which
+  memory when — ids and hashes only, never content. Deliberately no
+  foreign key to `engrams`: the audit trail must survive deletion.
 - **`engrams_fts`** — FTS5 virtual table over (id, content). FTS
   synchronization is performed in application code, not SQLite triggers
   (the FTS `delete` command is incompatible with SQLCipher's virtual-table
@@ -136,6 +146,8 @@ excluded from the default recall surface.
 | v4 → v5 | 2026-08-13 | `modified_at` |
 | v5 → v6 | 2026-08-14 | `synced_at` |
 | v6 → v7 | 2026-09-05 | `slack`, `discord`, `telegram` added to `source` constraint |
+| v7 → v8 | 2026-09-06 | `tombstones` table (atomic delete tombstones; sidecar imported one-time) |
+| v8 → v9 | 2026-09-06 | `access_events` access audit ledger |
 
 Column-adding migrations are idempotent "ensure" blocks so a vault that
 crashed mid-migration cannot claim a version it does not have.
