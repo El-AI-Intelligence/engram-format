@@ -69,7 +69,7 @@ key      = hex( Argon2id( passphrase,
 - Early passphrase vaults used
   `hex( SHA-256( passphrase ‖ ":" ‖ "axiom-engram-vault-v1" ) )`.
 
-## 4. Schema (version 9)
+## 4. Schema (version 10)
 
 Tracked via `PRAGMA user_version`. All tables are created idempotently
 (`IF NOT EXISTS`); migrations are versioned and run exactly once.
@@ -99,6 +99,13 @@ Tracked via `PRAGMA user_version`. All tables are created idempotently
 | `occurred_at` | TEXT | nullable |
 | `modified_at` | TEXT | edit propagation cursor |
 | `synced_at` | TEXT | per-memory sync cursor |
+| `agent_id` | TEXT | nullable; kernel-minted agent identity the memory belongs to (v10) |
+
+`agent_id` is set only when the capture happened inside an agent context;
+it is `NULL` on rows captured outside one (human notes, CLI captures with no
+agent in scope). `NULL` means "no agent context at capture", never "unknown
+agent" — pre-v10 rows are deliberately not backfilled, since attribution
+cannot be reconstructed after the fact.
 
 Quarantine convention: rows with `imagined = 1 AND grounded = 0` are
 excluded from the default recall surface.
@@ -148,6 +155,7 @@ excluded from the default recall surface.
 | v6 → v7 | 2026-09-05 | `slack`, `discord`, `telegram` added to `source` constraint |
 | v7 → v8 | 2026-09-06 | `tombstones` table (atomic delete tombstones; sidecar imported one-time) |
 | v8 → v9 | 2026-09-06 | `access_events` access audit ledger |
+| v9 → v10 | 2026-09-17 | `agent_id` — kernel-minted agent identity (NULL outside an agent context) |
 
 Column-adding migrations are idempotent "ensure" blocks so a vault that
 crashed mid-migration cannot claim a version it does not have.

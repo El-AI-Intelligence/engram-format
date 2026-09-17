@@ -350,6 +350,13 @@ pub struct MemoryEntry {
 
     // ── Context (structured metadata) ──────────────────
     pub context: serde_json::Value,
+
+    // ── Attribution ────────────────────────────────────
+    /// Kernel-minted agent identity this memory belongs to (schema v10).
+    /// `None` when captured outside an agent context. Absent from the JSON
+    /// payload when `None`, so pre-v10 readers see the old document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 impl MemoryEntry {
@@ -376,6 +383,7 @@ impl MemoryEntry {
             last_retrieved: None,
             occurred_at: None,
             context: serde_json::json!({}),
+            agent_id: None,
         }
     }
 
@@ -402,6 +410,7 @@ impl MemoryEntry {
             last_retrieved: None,
             occurred_at: None,
             context: serde_json::json!({}),
+            agent_id: None,
         }
     }
 }
@@ -431,6 +440,7 @@ impl From<Engram> for MemoryEntry {
             last_retrieved: e.last_retrieved,
             occurred_at: e.occurred_at,
             context: e.context,
+            agent_id: e.agent_id,
         }
     }
 }
@@ -464,6 +474,7 @@ impl From<MemoryEntry> for Engram {
             scope: m.scope.as_str().to_string(),
             content_type: m.content_type.as_str().to_string(),
             occurred_at: m.occurred_at,
+            agent_id: m.agent_id,
         }
     }
 }

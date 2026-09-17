@@ -201,6 +201,12 @@ pub struct Engram {
     pub content_type: String,
     /// When the event actually happened (may differ from created_at)
     pub occurred_at: Option<DateTime<Utc>>,
+    /// Kernel-minted agent identity this memory belongs to (schema v10).
+    /// `None` when the capture happened outside an agent context — a human
+    /// note, a CLI capture with no agent in scope. Absent from the JSON
+    /// payload when `None`, so pre-v10 readers and relays are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 impl Engram {
@@ -227,6 +233,7 @@ impl Engram {
             scope: "moment".into(),
             content_type: "text".into(),
             occurred_at: None,
+            agent_id: None,
         }
     }
 
@@ -253,6 +260,7 @@ impl Engram {
             scope: "moment".into(),
             content_type: "text".into(),
             occurred_at: None,
+            agent_id: None,
         }
     }
 }

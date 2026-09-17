@@ -24,7 +24,8 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             project         TEXT,
             tags            TEXT,
             content_hash    TEXT,
-            modified_at     TEXT
+            modified_at     TEXT,
+            agent_id        TEXT
         );
 
         CREATE TABLE IF NOT EXISTS engram_links (
@@ -166,7 +167,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Apply schema migrations for columns added after the initial release.
 ///
 /// Current schema version. Increment this when adding new migrations below.
-const CURRENT_SCHEMA_VERSION: i32 = 9;
+const CURRENT_SCHEMA_VERSION: i32 = 10;
 
 /// Versioned schema migrations using SQLite's `PRAGMA user_version`.
 ///
@@ -193,6 +194,9 @@ const CURRENT_SCHEMA_VERSION: i32 = 9;
 ///   v8 → v9: Added access_events table — the retrieval/export audit ledger
 ///            (who got which memory when; ids + hashes, never content)
 ///            (2026-09-07)
+///   v9 → v10: Added agent_id column — the kernel-minted agent identity a
+///             memory belongs to; NULL when captured outside an agent
+///             context (2026-09-17)
 #[allow(clippy::needless_return)]
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.query_row(
@@ -653,6 +657,43 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    // v10: agent_id — the kernel-minted agent identity a memory belongs to
+    // (NULL when captured outside an agent context, e.g. a human note or a
+    // CLI capture with no agent in scope). Same ungated idempotent "ensure"
+    // pattern as v4/v5/v6/v8/v9: not gated on `version < 10` so a vault that
+    // crashed mid-migration can't claim v10 without the column.
+    //
+    // Deliberately NO backfill: attribution cannot be reconstructed after the
+    // fact, and inventing an agent for pre-v10 rows would misattribute them.
+    // Rows captured before v10 stay NULL forever — NULL is not "unknown
+    // agent", it is "no agent context at capture time".
+    {
+        conn.execute_batch("BEGIN")?;
+
+        let has_column = |name: &str| -> rusqlite::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')")?;
+            let exists = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|col| col == name);
+            Ok(exists)
+        };
+
+        if !has_column("agent_id")? {
+            conn.execute("ALTER TABLE engrams ADD COLUMN agent_id TEXT", [])?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_engrams_agent_id ON engrams(agent_id);"
+        )?;
+
+        conn.execute(
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+            [],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 #[cfg(test)]
@@ -1025,5 +1066,127 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n2, 1, "re-migrate does not duplicate or clear rows");
+    }
+
+    /// v10: migrate() must add the nullable agent_id column on a pre-v10
+    /// vault (user_version 9), leave existing rows NULL rather than
+    /// backfilling an invented attribution, accept both attributed and
+    /// unattributed captures, and stay idempotent on re-run.
+    #[test]
+    fn migrate_adds_agent_id_column() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+
+        // Simulate a v9 vault: every v9 column and the v7 source CHECK,
+        // plus the v8/v9 tables — but no agent_id column.
+        conn.execute_batch(
+            "CREATE TABLE engrams (
+                id TEXT PRIMARY KEY,
+                layer TEXT NOT NULL,
+                source TEXT NOT NULL CHECK(source IN ('interaction','sensor','consolidation','imagined','chat','slack','discord','telegram','window','mic','agent','research','system','user','observation','ai-session','ai-tool')),
+                privacy_level TEXT NOT NULL DEFAULT 'cloud_first',
+                content TEXT NOT NULL,
+                context TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 1.0,
+                valence REAL NOT NULL DEFAULT 0.0,
+                retrievals INTEGER NOT NULL DEFAULT 0,
+                imagined INTEGER NOT NULL DEFAULT 0,
+                grounded INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_retrieved TEXT,
+                project TEXT,
+                tags TEXT,
+                scope TEXT NOT NULL DEFAULT 'moment',
+                content_type TEXT NOT NULL DEFAULT 'text',
+                occurred_at TEXT,
+                content_hash TEXT,
+                modified_at TEXT,
+                synced_at TEXT
+            );
+            CREATE TABLE tombstones (id TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
+            CREATE TABLE access_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL,
+                op TEXT NOT NULL CHECK(op IN ('get','search_hit','export')),
+                client TEXT NOT NULL DEFAULT 'http',
+                content_hash TEXT,
+                at TEXT NOT NULL
+            );"
+        ).unwrap();
+        conn.execute_batch("PRAGMA user_version = 9;").unwrap();
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at, modified_at, synced_at) \
+             VALUES ('m1', 'episodic', 'ai-session', 'pre-v10 note', '{}', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        // The column exists…
+        let has_col: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')").unwrap();
+            let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            cols.iter().any(|c| c == "agent_id")
+        };
+        assert!(has_col, "agent_id column should be added by migration");
+
+        // …the index exists…
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_engrams_agent_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1);
+
+        // …pre-v10 rows are NOT backfilled (NULL means "no agent context",
+        // which cannot be reconstructed after the fact)…
+        let legacy: Option<String> = conn
+            .query_row("SELECT agent_id FROM engrams WHERE id = 'm1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(legacy, None, "pre-v10 rows stay NULL, never misattributed");
+
+        // …an attributed capture writes and reads back…
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at, agent_id) \
+             VALUES ('m2', 'episodic', 'agent', 'agent note', '{}', '2026-09-17T00:00:00Z', 'agent_ker_1')",
+            [],
+        )
+        .unwrap();
+        // …and a capture with no agent in scope is still valid.
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at) \
+             VALUES ('m3', 'semantic', 'interaction', 'human note', '{}', '2026-09-17T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let attributed: Option<String> = conn
+            .query_row("SELECT agent_id FROM engrams WHERE id = 'm2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attributed.as_deref(), Some("agent_ker_1"));
+        let unattributed: Option<String> = conn
+            .query_row("SELECT agent_id FROM engrams WHERE id = 'm3'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unattributed, None);
+
+        // Schema version bumped to current.
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        // Re-running both is idempotent: no error, no row churn.
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM engrams", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3, "re-migrate does not duplicate or clear rows");
     }
 }
